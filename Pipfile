@@ -1,0 +1,17 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+pyzabbix = "*"
+pysnmp = "*"
+networkx = "*"
+pydot = "*"
+matplotlib = "*"
+
+[scripts]
+zabbix_lldp_map = "python zabbix_lldp_map.py"
+
+[requires]
+python_version = "3.6"
