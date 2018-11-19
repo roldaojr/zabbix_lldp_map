@@ -1,0 +1,4 @@
+networkx==2.2
+pydot==1.2.4
+pysnmp==4.4.6
+pyzabbix==0.7.5
