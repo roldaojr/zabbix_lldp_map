@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import asyncio
 import os
+from itertools import groupby, chain
 from pyzabbix import ZabbixAPI
 from pysnmp.hlapi import *
 import networkx as nx
@@ -15,25 +16,29 @@ SNMP_COMMUNITY = os.getenv('SNMP_COMMUNITY', 'públic')
 ZABBIX_MAP_NAME = os.getenv('ZABBIX_MAP_NAME', 'LLDP Devices')
 ZABBIX_MAP_WIDTH = int(os.getenv('ZABBIX_MAP_WIDTH', 1280))
 ZABBIX_MAP_HEIGHT = int(os.getenv('ZABBIX_MAP_HEIGHT', 720))
+SAVE_GRAPHVIZ_MAP = bool(os.getenv('SAVE_GRAPHVIZ_MAP', False))
 
 class ZabbixConnector(object):
     def __init__(self, url, username, password):
+        print('Connecting to zabbix')
         self.api = ZabbixAPI(url)
         self.api.session.verify = False
         self.api.login(username, password)
 
     def get_hosts_from_group(self, hostgroup):
+        print('Getting zabbix hosts from group %s' % hostgroup)
         groups = self.api.hostgroup.get(
             search={'name': hostgroup}, output=['groupid'])
         kwargs = {
             'groupids': groups[0]['groupid'],
-            'output': ['hostid', 'interfaces', 'status'],
+            'output': ['hostid', 'interfaces', 'status', 'name'],
             'selectInterfaces': ['type', 'ip'],
             'filter': {'status': 0}
         }
         return self.api.host.get(**kwargs)
 
     def get_icons(self):
+        print('Getting zabbix icons')
         icons = {}
         iconsData = self.api.image.get(output=["imageid","name"])
         for icon in iconsData:
@@ -45,7 +50,7 @@ class ZabbixConnector(object):
         for host in self.get_hosts_from_group(hostgroup):
             devices.append(LldpDevice(
                 ipaddress=host['interfaces'][0]['ip'],
-                zabbix_id=host['hostid']
+                zabbix_id=host['hostid'], name=host['name']
             ))
         return devices
 
@@ -76,6 +81,10 @@ class Snmp(object):
 
     @classmethod
     def walk(cls, ipaddress, community, oid):
+        if type(oid) == list:
+            oids = [ObjectType(ObjectIdentity(o)) for o in oid]
+        else:
+            oids = [ObjectType(ObjectIdentity(oid))]
         for (errorIndication,
             errorStatus,
             errorIndex,
@@ -83,7 +92,7 @@ class Snmp(object):
                                      CommunityData(community), 
                                      UdpTransportTarget((ipaddress, 161)),
                                      ContextData(),
-                                     ObjectType(ObjectIdentity(oid)),
+                                     *oids,
                                      lexicographicMode=False,
                                      lookupMib=False):
             if errorIndication:
@@ -114,32 +123,54 @@ class LLdpGraphGenerator(object):
         self._devices = devices
 
     async def device_locChassisId(self, device):
-        snmp_query = dict(Snmp.get(device.ipaddress, device.community, '1.0.8802.1.1.2.1.3.2.0'))
-        device.locChassisId = next(iter(snmp_query.values()))
+        snmp_result = Snmp.get(device.ipaddress, device.community, '1.0.8802.1.1.2.1.3.2.0')
+        for oid, value in snmp_result:
+            device.locChassisId = value
         return device
 
     async def device_remChassisIds(self, device, chassisId_list):
-        snmp_query = dict(Snmp.walk(device.ipaddress, device.community, '1.0.8802.1.1.2.1.4.1.1.5'))
-        device.remChassisIds = [cid for cid in snmp_query.values() if cid in chassisId_list]
+        snmp_result = Snmp.walk(device.ipaddress, device.community,
+                                ['1.0.8802.1.1.2.1.4.1.1.5', '1.0.8802.1.1.2.1.4.1.1.7'])
+        device.remChassisIds = []
+        device.portIds = []
+        def keyfunc(key):
+            oid, val = key
+            return oid[24:]
+        for k, g in groupby(snmp_result, key=keyfunc):
+            row = tuple(chain.from_iterable(g))
+            if row[1] not in chassisId_list:
+                continue
+            device.remChassisIds.append((row[1], row[3]))
         return device
 
     def _get_lldp_data(self):
         loop = asyncio.get_event_loop()
+        print('Getting devices ChassisID')
         loop.run_until_complete(asyncio.gather(
             *[self.device_locChassisId(d) for d in self._devices]
         ))
         chassisId_list = [device.locChassisId for device in devices]
+        print('Getting devices neighbors ChassisIDs')
         loop.run_until_complete(asyncio.gather(
             *[self.device_remChassisIds(d, chassisId_list) for d in self._devices]
         ))
+
+    def save_graphviz_dot(self, graph):
+        graph2 = nx.relabel_nodes(
+            graph, {d.locChassisId: d.name for d in self._devices})
+        nx.drawing.nx_pydot.write_dot(graph2, 'lldp.dot')
 
     def get_graph(self):
         self._get_lldp_data()
         graph = nx.Graph()
         for i, device in enumerate(self._devices, start=1):
             graph.add_node(device.locChassisId, zabbix_id=device.zabbix_id, index=i)
-            for chassisId in device.remChassisIds:
-                graph.add_edge(device.locChassisId, chassisId)
+            for chassisId, dportId in device.remChassisIds:
+                if graph.has_edge(chassisId, device.locChassisId):
+                    graph[chassisId][device.locChassisId]['taillabel'] = dportId
+                else:
+                    graph.add_edge(device.locChassisId, chassisId, headlabel=dportId)
+        self.save_graphviz_dot(graph)
         return graph
 
 
@@ -213,6 +244,9 @@ if __name__ == '__main__':
     devices = zabbix.get_devices(ZABBIX_HOSTGROUP)
     for device in devices:
         device.community = SNMP_COMMUNITY
-    graph = LLdpGraphGenerator(devices).get_graph()
+    generator = LLdpGraphGenerator(devices)
+    graph = generator.get_graph()
+    if SAVE_GRAPHVIZ_MAP:
+        generator.save_graphviz_dot(graph)
     map_generator = GraphToZabbixMap(zabbix)
     map_generator.generate_zabbix_map(graph, ZABBIX_MAP_NAME, ZABBIX_MAP_WIDTH, ZABBIX_MAP_HEIGHT)
