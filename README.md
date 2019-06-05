@@ -1,8 +1,11 @@
 # zabbix-lldp-map
 
 ## Requisitos
-	* Python >=3.5
-	* GraphViz (linha de comando)
+	* Python >=3.6
+	* networkx==2.2
+    * pydot==1.2.4
+    * pysnmp==4.4.6
+    * pyzabbix==0.7.5
 
 ## Usando
 
