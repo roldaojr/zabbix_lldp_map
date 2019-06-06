@@ -195,6 +195,7 @@ class LLdpGraphGenerator(object):
         self._get_lldp_data()
         graph = nx.Graph()
         for i, device in enumerate(self._devices, start=1):
+            device.inventory.update({'zbx_hostname': device.name})
             label = Template(GRAPHVIZ_LABEL_TEMPLATE).substitute(device.inventory)
             graph.add_node(device.locChassisId, zabbix_id=device.zabbix_id, index=i, label=label)
             for chassisId, dportId in device.remChassisIds:
