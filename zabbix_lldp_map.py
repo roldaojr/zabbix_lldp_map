@@ -1,32 +1,18 @@
 #!/usr/bin/python3
 import asyncio
 import os
+import yaml
 from collections import defaultdict
 from itertools import groupby, chain
 from string import Template
-from environs import Env
 from pyzabbix import ZabbixAPI
 from pysnmp.hlapi import *
 import networkx as nx
 import urllib3
 urllib3.disable_warnings()
 
-env = Env()
-env.read_env()
-
-SNMP_COMMUNITY = env('SNMP_COMMUNITY', 'públic')
-
-ZABBIX_URL = env('ZABBIX_URL', 'https://localhost/zabbix')
-ZABBIX_USERNAME = env('ZABBIX_USERNAME', 'zabbix')
-ZABBIX_PASSWORD = env('ZABBIX_PASSWORD', 'zabbix')
-ZABBIX_HOSTGROUP = env('ZABBIX_HOSTGROUP', 'Switches')
-ZABBIX_MAP_NAME = env('ZABBIX_MAP_NAME', 'LLDP Devices')
-ZABBIX_MAP_WIDTH = env.int('ZABBIX_MAP_WIDTH', 1280)
-ZABBIX_MAP_HEIGHT = env.int('ZABBIX_MAP_HEIGHT', 720)
-ZABBIX_INVENTORY_FIELDS = env.list('ZABBIX_INVENTORY_FIELDS', 'name,model,location')
-GRAPHVIZ_FILE = env('GRAPHVIZ_FILE', '')
-GRAPHVIZ_LAYOUT = env('GRAPHVIZ_LAYOUT', 'twopi')
-GRAPHVIZ_LABEL_TEMPLATE = env('GRAPHVIZ_LABEL_TEMPLATE', '${name}\n${model}')
+with open('config.yml', 'r') as ymlfile:
+    config = yaml.safe_load(ymlfile)
 
 class ZabbixConnector(object):
     def __init__(self, url, username, password):
@@ -41,8 +27,8 @@ class ZabbixConnector(object):
             search={'name': hostgroup}, output=['groupid'])
         kwargs = {
             'groupids': groups[0]['groupid'],
-            'output': ['hostid', 'interfaces', 'status', 'name', 'model', 'location'],
-            'selectInventory': ZABBIX_INVENTORY_FIELDS,
+            'output': ['hostid', 'interfaces', 'status', 'name'],
+            'selectInventory': config['zabbix']['inventory_fields'],
             'selectInterfaces': ['type', 'ip'],
             'filter': {'status': 0}
         }
@@ -166,6 +152,10 @@ class LLdpGraphGenerator(object):
             self._linkSpeed[device.locChassisId][row[1]] = row[3]
         return device
 
+    def _get_edge_attrs(self, speed):
+        if 'linkspeed' in config['graphviz']:
+            if speed in config['graphviz']['linkspeed']:
+                return config['graphviz']['linkspeed'][speed]
 
     def _get_lldp_data(self):
         loop = asyncio.get_event_loop()
@@ -183,26 +173,27 @@ class LLdpGraphGenerator(object):
             *[self.device_portLinkSpeed(d) for d in self._devices]
         ))
 
-    def save_graphviz_file(self, graph, SAVE_GRAPHVIZ_FILE):
+    def save_graphviz_file(self, graph, filename):
         graph2 = nx.relabel_nodes(
             graph, {d.locChassisId: d.name for d in self._devices})
         for name, data in graph2.nodes(data=True):
             del data['zabbix_id']
             del data['index']
-        nx.drawing.nx_pydot.write_dot(graph2, GRAPHVIZ_FILE)
+        nx.drawing.nx_pydot.write_dot(graph2, filename)
 
     def get_graph(self):
         self._get_lldp_data()
         graph = nx.Graph()
         for i, device in enumerate(self._devices, start=1):
             device.inventory.update({'zbx_hostname': device.name})
-            label = Template(GRAPHVIZ_LABEL_TEMPLATE).substitute(device.inventory)
+            label = Template(config['graphviz']['label_template']).substitute(device.inventory)
             graph.add_node(device.locChassisId, zabbix_id=device.zabbix_id, index=i, label=label)
             for chassisId, dportId in device.remChassisIds:
                 if graph.has_edge(chassisId, device.locChassisId):
                     graph[chassisId][device.locChassisId]['taillabel'] = dportId
                     linkSpeed = int(self._linkSpeed[chassisId].get(dportId, 0))//1000000
-                    graph[chassisId][device.locChassisId]['speed'] = linkSpeed
+                    for k, v in self._get_edge_attrs(linkSpeed).items():
+                        graph[chassisId][device.locChassisId][k] = v
                 else:
                     graph.add_edge(device.locChassisId, chassisId, headlabel=dportId)
         return graph
@@ -274,14 +265,18 @@ class GraphToZabbixMap(object):
 
 
 if __name__ == '__main__':
-    zabbix = ZabbixConnector(ZABBIX_URL, ZABBIX_USERNAME, ZABBIX_PASSWORD)
-    devices = zabbix.get_devices(ZABBIX_HOSTGROUP)
+    zbx_config = config.get('zabbix')
+    zabbix = ZabbixConnector(zbx_config['url'], zbx_config['username'],
+                             zbx_config['password'])
+    devices = zabbix.get_devices(zbx_config['hostgroup'])
     for device in devices:
-        device.community = SNMP_COMMUNITY
+        device.community = config['snmp']['community']
     generator = LLdpGraphGenerator(devices)
     graph = generator.get_graph()
-    if ZABBIX_MAP_NAME:
+    map_cfg = zbx_config.get('map')
+    if 'name' in map_cfg and map_cfg['name']:
         map_generator = GraphToZabbixMap(zabbix)
-        map_generator.generate_zabbix_map(graph, ZABBIX_MAP_NAME, ZABBIX_MAP_WIDTH, ZABBIX_MAP_HEIGHT)
-    if GRAPHVIZ_FILE:
-        generator.save_graphviz_file(graph, GRAPHVIZ_FILE)
+        map_generator.generate_zabbix_map(graph, map_cfg['name'], 
+                                          map_cfg['width'], map_cfg['height'])
+    if 'file' in config['graphviz'] and config['graphviz']['file']:
+        generator.save_graphviz_file(graph, config['graphviz']['file'])

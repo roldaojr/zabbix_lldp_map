@@ -1,0 +1,22 @@
+zabbix:
+  url: https://localhost/zabbix
+  username: zabbix
+  password: zabbix
+  hostgroup: Switches
+  map:
+    name: Network Map
+    width: 1275
+    height: 690
+  inventory_fields:
+    - model
+    - location
+snmp:
+  community: public
+graphviz:
+  linkspeed:
+    100:
+      penwidth: 1
+    1000:
+      penwidth: 2
+  file: netowrk-map.gv
+  label_template: $zbx_hostname\n$model\n$location

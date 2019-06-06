@@ -9,6 +9,7 @@ pysnmp = "*"
 networkx = "*"
 pydot = "*"
 environs = "*"
+pyyaml = "*"
 
 [scripts]
 zabbix_lldp_map = "python zabbix_lldp_map.py"
