@@ -5,10 +5,8 @@ name = "pypi"
 
 [packages]
 pyzabbix = "*"
-pysnmp = "*"
 networkx = "*"
 pydot = "*"
-environs = "*"
 pyyaml = "*"
 
 [scripts]

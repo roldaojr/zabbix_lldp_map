@@ -1,18 +1,26 @@
 #!/usr/bin/python3
-import asyncio
+import re
 import os
 import yaml
+import pydot
 from collections import defaultdict
 from itertools import groupby, chain
 from string import Template
 from pyzabbix import ZabbixAPI
-from pysnmp.hlapi import *
 import networkx as nx
 import urllib3
 urllib3.disable_warnings()
 
 with open('config.yml', 'r') as ymlfile:
     config = yaml.safe_load(ymlfile)
+
+def get_config(name, default=None):
+    keys = name.split('.')
+    props = config
+    for key in keys[:-1]:
+        props = props.get(key, {})
+    return props.get(keys[-1], default)
+
 
 class ZabbixConnector(object):
     def __init__(self, url, username, password):
@@ -28,85 +36,58 @@ class ZabbixConnector(object):
         kwargs = {
             'groupids': groups[0]['groupid'],
             'output': ['hostid', 'interfaces', 'status', 'name'],
-            'selectInventory': config['zabbix']['inventory_fields'],
+            'selectInventory': get_config('zabbix.inventory_fields', []) + ['type'],
             'selectInterfaces': ['type', 'ip'],
             'filter': {'status': 0}
         }
         return self.api.host.get(**kwargs)
 
+    def get_items(self, hosts, key, any=True):
+        print('Getting data from hosts')
+        kwargs = {
+            'output': ['hostid', 'name', 'key_', 'lastvalue'],
+            'hostids': [h['hostid'] for h in hosts],
+            'search': {'key_': key},
+            'searchByAny': any
+        }
+        return self.api.item.get(**kwargs)
+
     def get_icons(self):
         print('Getting zabbix icons')
         icons = {}
-        iconsData = self.api.image.get(output=["imageid","name"])
+        iconsData = self.api.image.get(output=["imageid", "name"])
         for icon in iconsData:
             icons[icon["name"]] = icon["imageid"]
         return icons
 
     def get_devices(self, hostgroup):
-        devices = []
-        for host in self.get_hosts_from_group(hostgroup):
-            devices.append(LldpDevice(
-                ipaddress=host['interfaces'][0]['ip'],
-                zabbix_id=host['hostid'], name=host['name'],
-                inventory=host['inventory']
-            ))
+        devices = {}
+        hosts = self.get_hosts_from_group(hostgroup)
+        for host in hosts:
+            devices[host['hostid']] = NetworkDevice(
+                name=host['name'],
+                inventory=host['inventory'],
+                neighbors=defaultdict(dict)
+            )
+
+        items = self.get_items(hosts, 'lldp.loc.sys.name')
+        for item in items:
+            devices[item['hostid']].sysname = item['lastvalue']
+
+        neighbors = self.get_items(hosts, ['lldp.loc.if.name',
+                                           'lldp.loc.if.ifSpeed',
+                                           'lldp.rem.sysname',
+                                           'lldp.rem.port.id'])
+        for neighbor in neighbors:
+            port = re.findall(r'\[Port - ([\w:\/]+)\]', neighbor['name'])
+            prop = re.findall(r'^([\w\.]+)\[', neighbor['key_'])
+            if neighbor['lastvalue'] != '** No Information **' and port and prop:
+                devices[neighbor['hostid']].neighbors[port[0]][prop[0]] = neighbor['lastvalue']
+
         return devices
 
 
-class Snmp(object):
-    @classmethod
-    def get(cls, ipaddress, community, oid):
-        errorIndication, errorStatus, errorIndex, varBinds = next(
-            getCmd(SnmpEngine(),
-                   CommunityData(community), 
-                   UdpTransportTarget((ipaddress, 161)),
-                   ContextData(),
-                   ObjectType(ObjectIdentity(oid)),
-                   lexicographicMode=False,
-                   lookupMib=False))
-
-        if errorIndication:
-            print(errorIndication)
-            return
-        elif errorStatus:
-            print('%s at %s' % (
-                errorStatus.prettyPrint(),
-                errorIndex and varBinds[int(errorIndex) - 1][0] or '?'
-            ))
-        else:
-            for varBind in varBinds:
-                yield varBind[0].prettyPrint(), varBind[1].prettyPrint()
-
-    @classmethod
-    def walk(cls, ipaddress, community, oid):
-        if type(oid) == list:
-            oids = [ObjectType(ObjectIdentity(o)) for o in oid]
-        else:
-            oids = [ObjectType(ObjectIdentity(oid))]
-        for (errorIndication,
-            errorStatus,
-            errorIndex,
-            varBindTable) in nextCmd(SnmpEngine(),
-                                     CommunityData(community), 
-                                     UdpTransportTarget((ipaddress, 161)),
-                                     ContextData(),
-                                     *oids,
-                                     lexicographicMode=False,
-                                     lookupMib=False):
-            if errorIndication:
-                print(errorIndication)
-                break
-            elif errorStatus:
-                print('%s at %s' % (
-                    errorStatus.prettyPrint(),
-                    errorIndex and varBinds[int(errorIndex) - 1][0] or '?'
-                ))
-            else:
-                for varBind in varBindTable:
-                    yield varBind[0].prettyPrint(), varBind[1].prettyPrint()
-
-
-class LldpDevice(object):
+class NetworkDevice(object):
     def __init__(self, *args, **kwargs):
         for key, value in kwargs.items():
             setattr(self, key, value)
@@ -119,83 +100,84 @@ class LldpDevice(object):
 class LLdpGraphGenerator(object):
     def __init__(self, devices):
         self._devices = devices
-        self._linkSpeed = defaultdict(dict)
 
-    async def device_locChassisId(self, device):
-        snmp_result = Snmp.get(device.ipaddress, device.community, '1.0.8802.1.1.2.1.3.2.0')
-        for oid, value in snmp_result:
-            device.locChassisId = value
-        return device
+    def _get_port_number(self, text):
+        result = re.findall(r'(\d+)$', text)
+        if len(result) > 0:
+            return result[0]
+        else:
+            return ''
 
-    async def device_remChassisIds(self, device, chassisId_list):
-        snmp_result = Snmp.walk(device.ipaddress, device.community,
-                                ['1.0.8802.1.1.2.1.4.1.1.5', '1.0.8802.1.1.2.1.4.1.1.7'])
-        device.remChassisIds = []
-        def keyfunc(key):
-            oid, val = key
-            return oid[24:]
-        for k, g in groupby(snmp_result, key=keyfunc):
-            row = tuple(chain.from_iterable(g))
-            if row[1] not in chassisId_list:
-                continue
-            device.remChassisIds.append((row[1], row[3]))
-        return device
+    def _get_attributes(self, section, key):
+        attributes = config.get('graphviz', {}).get(section, {})
+        return attributes.get(key, {})
 
-    async def device_portLinkSpeed(self, device):
-        snmp_result = Snmp.walk(device.ipaddress, device.community,
-                                ['1.3.6.1.2.1.2.2.1.2', '1.3.6.1.2.1.2.2.1.5'])
-        def keyfunc(key):
-            oid, val = key
-            return oid[20:]
-        for k, g in groupby(snmp_result, key=keyfunc):
-            row = tuple(chain.from_iterable(g))
-            self._linkSpeed[device.locChassisId][row[1]] = row[3]
-        return device
-
-    def _get_edge_attrs(self, speed):
-        if 'linkspeed' in config['graphviz']:
-            if speed in config['graphviz']['linkspeed']:
-                return config['graphviz']['linkspeed'][speed]
-
-    def _get_lldp_data(self):
-        loop = asyncio.get_event_loop()
-        print('Getting devices ChassisID')
-        loop.run_until_complete(asyncio.gather(
-            *[self.device_locChassisId(d) for d in self._devices]
-        ))
-        chassisId_list = [device.locChassisId for device in devices]
-        print('Getting devices neighbors ChassisIDs')
-        loop.run_until_complete(asyncio.gather(
-            *[self.device_remChassisIds(d, chassisId_list) for d in self._devices]
-        ))
-        print('Getting link speed')
-        loop.run_until_complete(asyncio.gather(
-            *[self.device_portLinkSpeed(d) for d in self._devices]
-        ))
+    def get_pydot(self, graph):
+        # remove zabbix map attributes
+        for name, data in graph.nodes(data=True):
+            if 'zabbix_id' in data:
+                del data['zabbix_id']
+            if 'index' in data:
+                del data['index']
+        # create pyDot Graph
+        currentG = nx.drawing.nx_pydot.to_pydot(graph)
+        dotG = pydot.Dot(graph_type='graph', strict=True)
+        # collect image names
+        images = set(nx.get_node_attributes(graph, 'image').values())
+        defaultImage = get_config('graphviz.attributes.node.image')
+        if defaultImage:
+            images.add(defaultImage)
+        imagepath = os.path.abspath(get_config('graphviz.imagepath'))
+        dotG.set_shape_files([os.path.join(imagepath, img) for img in set(images) if img is not None])
+        # set graph, edge and node defaults
+        dotG.set_graph_defaults(**get_config('graphviz.attributes.graph', {}))
+        dotG.set_node_defaults(**get_config('graphviz.attributes.node', {}))
+        dotG.set_edge_defaults(**get_config('graphviz.attributes.edge', {}))
+        # add nodes and edges to pyDot graph
+        for node in currentG.get_nodes():
+            dotG.add_node(node)
+        for edge in currentG.get_edges():
+            dotG.add_edge(edge)
+        # return pyDot graph
+        return dotG
 
     def save_graphviz_file(self, graph, filename):
-        graph2 = nx.relabel_nodes(
-            graph, {d.locChassisId: d.name for d in self._devices})
-        for name, data in graph2.nodes(data=True):
-            del data['zabbix_id']
-            del data['index']
-        nx.drawing.nx_pydot.write_dot(graph2, filename)
+        pydotG = self.get_pydot(graph)
+        pydotG.write(filename)
+
+    def save_image(self, graph, filename):
+        pydotG = self.get_pydot(graph)
+        pydotG.write_png(filename)
 
     def get_graph(self):
-        self._get_lldp_data()
         graph = nx.Graph()
-        for i, device in enumerate(self._devices, start=1):
+        graph.attrs = self._get_attributes('attributes', 'graph')
+        graph.node_attrs = self._get_attributes('attributes', 'node')
+        graph.edge_attrs = self._get_attributes('attributes', 'edge')
+        device_sysnames = [d.sysname for d in self._devices.values() if getattr(d, 'sysname', None)]
+        for i, (zabbix_id, device) in enumerate(self._devices.items(), start=1):
+            if not getattr(device, 'sysname', None):
+                continue
             device.inventory.update({'zbx_hostname': device.name})
-            label = Template(config['graphviz']['label_template']).substitute(device.inventory)
-            graph.add_node(device.locChassisId, zabbix_id=device.zabbix_id, index=i, label=label)
-            for chassisId, dportId in device.remChassisIds:
-                if graph.has_edge(chassisId, device.locChassisId):
-                    graph[chassisId][device.locChassisId]['taillabel'] = dportId
-                    linkSpeed = int(self._linkSpeed[chassisId].get(dportId, 0))//1000000
-                    for k, v in self._get_edge_attrs(linkSpeed).items():
-                        graph[chassisId][device.locChassisId][k] = v
+            label = Template(get_config('graphviz.node_label_template', '$zbx_hostname')).substitute(device.inventory)
+            graph.add_node(device.sysname, zabbix_id=zabbix_id, index=i, label=label,
+                           image=get_config('iconmap', {}).get(device.inventory.get('type', '')))
+            for idx, neighbor in device.neighbors.items():
+                remSysName = neighbor.get('lldp.rem.sysname')
+                if remSysName is None or remSysName not in device_sysnames:
+                    continue
+                if graph.has_edge(neighbor['lldp.rem.sysname'], device.sysname) and \
+                    get_config('graphviz.edge_label'):
+                    edge = graph[neighbor['lldp.rem.sysname']][device.sysname]
+                    edge['taillabel'] = self._get_port_number(neighbor.get('lldp.rem.port.id', ''))
                 else:
-                    graph.add_edge(device.locChassisId, chassisId, headlabel=dportId)
+                    linkSpeed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
+                    attrs = self._get_attributes('linkspeed', linkSpeed)
+                    graph.add_edge(device.sysname, neighbor['lldp.rem.sysname'], **attrs)
+                    if get_config('graphviz.edge_label'):
+                        edge = graph[device.sysname][neighbor['lldp.rem.sysname']]
+                        edge['headlabel'] = self._get_port_number(neighbor.get('lldp.rem.port.id', ''))
+
         return graph
 
 
@@ -210,18 +192,20 @@ class GraphToZabbixMap(object):
             'elements': [{'hostid': zabbix_id}],
             'x': x,
             'y': y,
-            'use_iconmap': 0,
+            'use_iconmap': 1,
             'elementtype': 0,
-            'iconid_off': self._icons['Switch_(48)'],
+            'iconid_off': self._icons['Switch_(24)'],
         }
 
     def _generate_map_elements(self, G, width, height):
         G.graph['dpi'] = 100
         G.graph['size'] = '%s,%s!' % (width/100, height/100)
         G.graph['ratio'] = 'fill'
+        G.graph.update(get_config('graphviz.attributes.graph', {}))
         nodes_idx = nx.get_node_attributes(G, 'index')
         zabbix_ids = nx.get_node_attributes(G, 'zabbix_id')
-        nodes_pos = nx.nx_pydot.graphviz_layout(G, GRAPHVIZ_LAYOUT)
+        nodes_pos = nx.nx_pydot.graphviz_layout(
+            G, get_config('graphviz.attributes.graph.layout', 'dot'))
         max_x, max_y = map(max, zip(*nodes_pos.values()))
         elements = []
 
@@ -265,12 +249,10 @@ class GraphToZabbixMap(object):
 
 
 if __name__ == '__main__':
-    zbx_config = config.get('zabbix')
+    zbx_config = get_config('zabbix')
     zabbix = ZabbixConnector(zbx_config['url'], zbx_config['username'],
                              zbx_config['password'])
     devices = zabbix.get_devices(zbx_config['hostgroup'])
-    for device in devices:
-        device.community = config['snmp']['community']
     generator = LLdpGraphGenerator(devices)
     graph = generator.get_graph()
     map_cfg = zbx_config.get('map')
@@ -278,5 +260,7 @@ if __name__ == '__main__':
         map_generator = GraphToZabbixMap(zabbix)
         map_generator.generate_zabbix_map(graph, map_cfg['name'], 
                                           map_cfg['width'], map_cfg['height'])
-    if 'file' in config['graphviz'] and config['graphviz']['file']:
-        generator.save_graphviz_file(graph, config['graphviz']['file'])
+    if get_config('graphviz.file'):
+        generator.save_graphviz_file(graph, get_config('graphviz.file'))
+    if get_config('graphviz.imagefile'):
+        generator.save_image(graph, get_config('graphviz.imagefile'))
