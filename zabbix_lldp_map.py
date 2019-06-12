@@ -77,7 +77,9 @@ class ZabbixConnector(object):
         neighbors = self.get_items(hosts, ['lldp.loc.if.name',
                                            'lldp.loc.if.ifSpeed',
                                            'lldp.rem.sysname',
-                                           'lldp.rem.port.id'])
+                                           'lldp.rem.port.id',
+                                           'lldp.rem.port.type',
+                                           'lldp.rem.port.desc'])
         for neighbor in neighbors:
             port = re.findall(r'\[Port - ([\w:\/]+)\]', neighbor['name'])
             prop = re.findall(r'^([\w\.]+)\[', neighbor['key_'])
@@ -166,17 +168,18 @@ class LLdpGraphGenerator(object):
                 remSysName = neighbor.get('lldp.rem.sysname')
                 if remSysName is None or remSysName not in device_sysnames:
                     continue
-                if graph.has_edge(neighbor['lldp.rem.sysname'], device.sysname) and \
-                    get_config('graphviz.edge_label'):
-                    edge = graph[neighbor['lldp.rem.sysname']][device.sysname]
-                    edge['taillabel'] = self._get_port_number(neighbor.get('lldp.rem.port.id', ''))
-                else:
-                    linkSpeed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
-                    attrs = self._get_attributes('linkspeed', linkSpeed)
-                    graph.add_edge(device.sysname, neighbor['lldp.rem.sysname'], **attrs)
-                    if get_config('graphviz.edge_label'):
-                        edge = graph[device.sysname][neighbor['lldp.rem.sysname']]
-                        edge['headlabel'] = self._get_port_number(neighbor.get('lldp.rem.port.id', ''))
+                linkSpeed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
+                attrs = self._get_attributes('linkspeed', linkSpeed)
+                if get_config('graphviz.edge_label'):
+                    if neighbor.get('lldp.rem.port.type') == '3':
+                        key = 'lldp.rem.port.desc'
+                    else:
+                        key = 'lldp.rem.port.id'
+                    attrs.update({
+                        'taillabel': neighbor.get('lldp.loc.if.name', ''),
+                        'headlabel': neighbor.get(key, '')
+                    })
+                graph.add_edge(device.sysname, neighbor['lldp.rem.sysname'], **attrs)
 
         return graph
 
