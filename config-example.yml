@@ -21,24 +21,27 @@ graphviz:
       layout: dot
       fontname: Arial
       fontsize: 8
+      pad: 0.5
+      nodesep: 0.25
     node:
       fontname: Helvetica
       fontsize: 8
       fontcolor: "#000000"
       shape: none
-      width: 0.8
-      height: 0.6
+      width: 1
+      height: 1
       fixedsize: true
     edge:
       fontname: Arial
       fontsize: 8
       color: "#4488dd"
       fontcolor: "#ff0000"
-    linkspeed:
+  linkspeed:
     100:
-      penwidth: 1
+      penwidth: 0.75
     1000:
-      penwidth: 2
+      penwidth: 1.5
   file: netowrk-map.gv
-  label_template: $zbx_hostname\n$model
+  imagefile: netowrk-map.png
+  node_label_template: "\n\n\n\n\n$zbx_hostname\n$model"
   edge_label: false
