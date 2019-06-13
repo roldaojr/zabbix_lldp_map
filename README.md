@@ -1,31 +1,28 @@
 # zabbix-lldp-map
 
+Gerar mapa da rede a partir dos dados de LLDP
+
 ## Requisitos
-	* Python >=3.6
-	* networkx==2.2
+    * Python >=3.6
+    * networkx==2.2
     * pydot==1.2.4
-    * pysnmp==4.4.6
     * pyzabbix==0.7.5
 
-## Usando
+Para que o mapa seja gerado é necessário a instalação do modulo do zabbix para descoberta LLDP (https://github.com/zabbix-book/snmp_lldp). E a importação dos templates incluídos do projeto.
 
-Executar o comando dentro na pasta do arquivo
 
-	pip install -r requirements.txt
+## Instalando
 
-Para gerar o mapa
+Executar o comando dentro na pasta do projeto
 
-	python3 zabbix_lldp_map.py
+    pip install -r requirements.txt
 
-## Configurações
+## Gerar o mapa
 
-As configurações podem ser definidas como variáveis e ambiente ou definidas dentro do arquivo .py
+Criar um grupo de hosts e adicionar os dispositivos que serão exibidos no mapa
 
-	* ZABBIX_URL (URL do servidor zabbix)
-	* ZABBIX_USERNAME (usuário do zabbix)
-	* ZABBIX_PASSWORD (senha do usuário do zabbix)
-	* ZABBIX_HOSTGROUP (grupo de hosts a mostrar no mapa)
-	* SNMP_COMMUNITY (comunidade snmp)
-	* ZABBIX_MAP_NAME (nome do mapa no zabbix)
-	* ZABBIX_MAP_WIDTH (largura do mapa em pixeis)
-	* ZABBIX_MAP_HEIGHT (altura do mapa em pixeis)
+Copiar config-example.yml para config.yml e fazer as alterações necessárias
+
+Executar o seguinte comando na pasta do projeto
+
+    python3 zabbix_lldp_map.py
