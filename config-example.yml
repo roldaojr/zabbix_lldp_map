@@ -43,5 +43,5 @@ graphviz:
       penwidth: 1.5
   file: netowrk-map.gv
   imagefile: netowrk-map.png
-  node_label_template: "\n\n\n\n\n$zbx_hostname\n$model"
+  node_label_template: "\n\n\n\n\n$zabbix_name\n$model"
   edge_label: false

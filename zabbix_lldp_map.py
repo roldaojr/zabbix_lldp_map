@@ -36,7 +36,8 @@ class ZabbixConnector(object):
         kwargs = {
             'groupids': groups[0]['groupid'],
             'output': ['hostid', 'interfaces', 'status', 'name'],
-            'selectInventory': get_config('zabbix.inventory_fields', []) + ['type'],
+            'selectInventory': get_config(
+                'zabbix.inventory_fields', []) + ['name', 'type'],
             'selectInterfaces': ['type', 'ip'],
             'filter': {'status': 0}
         }
@@ -67,12 +68,14 @@ class ZabbixConnector(object):
             devices[host['hostid']] = NetworkDevice(
                 name=host['name'],
                 inventory=host['inventory'],
-                neighbors=defaultdict(dict)
+                neighbors=defaultdict(dict),
+                sysname=host['inventory'].get('name', '')
             )
 
         items = self.get_items(hosts, 'lldp.loc.sys.name')
         for item in items:
-            devices[item['hostid']].sysname = item['lastvalue']
+            if item['lastvalue']:
+                devices[item['hostid']].sysname = item['lastvalue']
 
         neighbors = self.get_items(hosts, ['lldp.loc.if.name',
                                            'lldp.loc.if.ifSpeed',
@@ -156,17 +159,18 @@ class LLdpGraphGenerator(object):
         graph.attrs = self._get_attributes('attributes', 'graph')
         graph.node_attrs = self._get_attributes('attributes', 'node')
         graph.edge_attrs = self._get_attributes('attributes', 'edge')
-        device_sysnames = [d.sysname for d in self._devices.values() if getattr(d, 'sysname', None)]
+        device_names = [d.sysname for d in self._devices.values() if getattr(d, 'sysname', None)]
         for i, (zabbix_id, device) in enumerate(self._devices.items(), start=1):
             if not getattr(device, 'sysname', None):
                 continue
-            device.inventory.update({'zbx_hostname': device.name})
-            label = Template(get_config('graphviz.node_label_template', '$zbx_hostname')).substitute(device.inventory)
+            device.inventory.update({'zabbix_name': device.name})
+            label = Template(get_config(
+                'graphviz.node_label_template', '$zabbix_name')).substitute(device.inventory)
             graph.add_node(device.sysname, zabbix_id=zabbix_id, index=i, label=label,
                            image=get_config('iconmap', {}).get(device.inventory.get('type', '')))
             for idx, neighbor in device.neighbors.items():
                 remSysName = neighbor.get('lldp.rem.sysname')
-                if remSysName is None or remSysName not in device_sysnames:
+                if remSysName is None or remSysName not in device_names:
                     continue
                 linkSpeed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
                 attrs = self._get_attributes('linkspeed', linkSpeed)
@@ -230,6 +234,7 @@ class GraphToZabbixMap(object):
         return links
 
     def generate_zabbix_map(self, G, mapname, width, height):
+        print('Generating map %s (%dx%d)...' % (mapname, width, height))
         map_params = {
             'name': mapname,
             'label_format': 1, # ADVANCED_LABELS
