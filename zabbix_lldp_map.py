@@ -22,6 +22,30 @@ def get_config(name, default=None):
     return props.get(keys[-1], default)
 
 
+def nx_to_pydot(graph):
+    # create pyDot Graph
+    currentG = nx.drawing.nx_pydot.to_pydot(graph)
+    dotG = pydot.Dot(graph_type='graph', strict=True)
+    # collect image names
+    images = set(nx.get_node_attributes(graph, 'image').values())
+    defaultImage = get_config('graphviz.attributes.node.image')
+    if defaultImage:
+        images.add(defaultImage)
+    imagepath = os.path.abspath(get_config('graphviz.imagepath'))
+    dotG.set_shape_files([os.path.join(imagepath, img) for img in set(images) if img is not None])
+    # set graph, edge and node defaults
+    dotG.set_graph_defaults(**get_config('graphviz.attributes.graph', {}))
+    dotG.set_node_defaults(**get_config('graphviz.attributes.node', {}))
+    dotG.set_edge_defaults(**get_config('graphviz.attributes.edge', {}))
+    # add nodes and edges to pyDot graph
+    for node in currentG.get_nodes():
+        dotG.add_node(node)
+    for edge in currentG.get_edges():
+        dotG.add_edge(edge)
+    # return pyDot graph
+    return dotG
+
+
 class ZabbixConnector(object):
     def __init__(self, url, username, password):
         print('Connecting to zabbix')
@@ -117,41 +141,14 @@ class LLdpGraphGenerator(object):
         attributes = config.get('graphviz', {}).get(section, {})
         return attributes.get(key, {})
 
-    def get_pydot(self, graph):
-        # remove zabbix map attributes
-        for name, data in graph.nodes(data=True):
-            if 'zabbix_id' in data:
-                del data['zabbix_id']
-            if 'index' in data:
-                del data['index']
-        # create pyDot Graph
-        currentG = nx.drawing.nx_pydot.to_pydot(graph)
-        dotG = pydot.Dot(graph_type='graph', strict=True)
-        # collect image names
-        images = set(nx.get_node_attributes(graph, 'image').values())
-        defaultImage = get_config('graphviz.attributes.node.image')
-        if defaultImage:
-            images.add(defaultImage)
-        imagepath = os.path.abspath(get_config('graphviz.imagepath'))
-        dotG.set_shape_files([os.path.join(imagepath, img) for img in set(images) if img is not None])
-        # set graph, edge and node defaults
-        dotG.set_graph_defaults(**get_config('graphviz.attributes.graph', {}))
-        dotG.set_node_defaults(**get_config('graphviz.attributes.node', {}))
-        dotG.set_edge_defaults(**get_config('graphviz.attributes.edge', {}))
-        # add nodes and edges to pyDot graph
-        for node in currentG.get_nodes():
-            dotG.add_node(node)
-        for edge in currentG.get_edges():
-            dotG.add_edge(edge)
-        # return pyDot graph
-        return dotG
-
     def save_graphviz_file(self, graph, filename):
-        pydotG = self.get_pydot(graph)
+        print('Saving file %s...' % filename)
+        pydotG = nx_to_pydot(graph)
         pydotG.write(filename)
 
     def save_image(self, graph, filename):
-        pydotG = self.get_pydot(graph)
+        print('Saving file %s...' % filename)
+        pydotG = nx_to_pydot(graph)
         pydotG.write_png(filename)
 
     def get_graph(self):
@@ -159,6 +156,7 @@ class LLdpGraphGenerator(object):
         graph.attrs = self._get_attributes('attributes', 'graph')
         graph.node_attrs = self._get_attributes('attributes', 'node')
         graph.edge_attrs = self._get_attributes('attributes', 'edge')
+        graph.zabbix_nodes = {}
         device_names = [d.sysname for d in self._devices.values() if getattr(d, 'sysname', None)]
         for i, (zabbix_id, device) in enumerate(self._devices.items(), start=1):
             if not getattr(device, 'sysname', None):
@@ -166,8 +164,9 @@ class LLdpGraphGenerator(object):
             device.inventory.update({'zabbix_name': device.name})
             label = Template(get_config(
                 'graphviz.node_label_template', '$zabbix_name')).substitute(device.inventory)
-            graph.add_node(device.sysname, zabbix_id=zabbix_id, index=i, label=label,
+            graph.add_node(device.sysname, label=label,
                            image=get_config('iconmap', {}).get(device.inventory.get('type', '')))
+            graph.zabbix_nodes[device.sysname] = {'zabbix_id': zabbix_id, 'index': i}
             for idx, neighbor in device.neighbors.items():
                 remSysName = neighbor.get('lldp.rem.sysname')
                 if remSysName is None or remSysName not in device_names:
@@ -205,12 +204,16 @@ class GraphToZabbixMap(object):
         }
 
     def _generate_map_elements(self, G, width, height):
-        G.graph['dpi'] = 100
-        G.graph['size'] = '%s,%s!' % (width/100, height/100)
-        G.graph['ratio'] = 'fill'
-        G.graph.update(get_config('graphviz.attributes.graph', {}))
-        nodes_idx = nx.get_node_attributes(G, 'index')
-        zabbix_ids = nx.get_node_attributes(G, 'zabbix_id')
+        zbxG = G.copy()
+        zbxG.graph['dpi'] = 100
+        zbxG.graph['size'] = '%s,%s!' % (width/100, height/100)
+        zbxG.graph['ratio'] = 'fill'
+        zbxG.graph.update(G.attrs)
+        for name, value in G.node_attrs.items():
+            nx.set_node_attributes(zbxG, name, value)
+        for name, value in G.edge_attrs.items():
+            nx.set_edge_attributes(zbxG, name, value)
+
         nodes_pos = nx.nx_pydot.graphviz_layout(
             G, get_config('graphviz.attributes.graph.layout', 'dot'))
         max_x, max_y = map(max, zip(*nodes_pos.values()))
@@ -219,17 +222,19 @@ class GraphToZabbixMap(object):
         for i, (node, (x, y)) in enumerate(nodes_pos.items(), start=1):
             node_x = int(x*width/max_x*0.9-x*0.1)
             node_y = int((height-y*height/max_y)*0.9+y*0.1)
-            elements.append(self._get_map_element(nodes_idx[node], zabbix_ids[node], node_x, node_y))
+            elements.append(self._get_map_element(
+                G.zabbix_nodes[node]['index'],
+                G.zabbix_nodes[node]['zabbix_id'],
+                node_x, node_y))
 
         return elements
 
     def _generate_map_links(self, G):
-        nodes_idx = nx.get_node_attributes(G, 'index')
         links = []
         for node1, node2, data in G.edges(data=True):
             links.append({
-                'selementid1': nodes_idx[node1],
-                'selementid2': nodes_idx[node2],
+                'selementid1': G.zabbix_nodes[node1]['index'],
+                'selementid2': G.zabbix_nodes[node2]['index'],
             })
         return links
 
@@ -266,7 +271,7 @@ if __name__ == '__main__':
     map_cfg = zbx_config.get('map')
     if 'name' in map_cfg and map_cfg['name']:
         map_generator = GraphToZabbixMap(zabbix)
-        map_generator.generate_zabbix_map(graph, map_cfg['name'], 
+        map_generator.generate_zabbix_map(graph, map_cfg['name'],
                                           map_cfg['width'], map_cfg['height'])
     if get_config('graphviz.file'):
         generator.save_graphviz_file(graph, get_config('graphviz.file'))
