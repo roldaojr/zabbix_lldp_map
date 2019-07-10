@@ -7,6 +7,7 @@ zabbix:
     name: Network Map
     width: 1275
     height: 690
+    default_icon: Switch_(24)
   inventory_fields:
     - model
 snmp:

@@ -3,11 +3,12 @@ import re
 import os
 import yaml
 import pydot
+from copy import copy
+from locale import getpreferredencoding
 from collections import defaultdict
-from itertools import groupby, chain
 from string import Template
 from pyzabbix import ZabbixAPI
-import networkx as nx
+from pydot import Dot, Graph, Node, Edge
 import urllib3
 urllib3.disable_warnings()
 
@@ -21,29 +22,21 @@ def get_config(name, default=None):
         props = props.get(key, {})
     return props.get(keys[-1], default)
 
-
-def nx_to_pydot(graph):
-    # create pyDot Graph
-    currentG = nx.drawing.nx_pydot.to_pydot(graph)
-    dotG = pydot.Dot(graph_type='graph', strict=True)
-    # collect image names
-    images = set(nx.get_node_attributes(graph, 'image').values())
-    defaultImage = get_config('graphviz.attributes.node.image')
-    if defaultImage:
-        images.add(defaultImage)
+def get_images_paths(graph):
+    images = set([node.get('image') for node in graph.get_nodes()])
+    images.add(get_config('graphviz.attributes.node.image', ''))
     imagepath = os.path.abspath(get_config('graphviz.imagepath'))
-    dotG.set_shape_files([os.path.join(imagepath, img) for img in set(images) if img is not None])
-    # set graph, edge and node defaults
-    dotG.set_graph_defaults(**get_config('graphviz.attributes.graph', {}))
-    dotG.set_node_defaults(**get_config('graphviz.attributes.node', {}))
-    dotG.set_edge_defaults(**get_config('graphviz.attributes.edge', {}))
-    # add nodes and edges to pyDot graph
-    for node in currentG.get_nodes():
-        dotG.add_node(node)
-    for edge in currentG.get_edges():
-        dotG.add_edge(edge)
-    # return pyDot graph
-    return dotG
+    return [os.path.join(imagepath, img) for img in set(images) if img]
+
+
+class CustomObject(object):
+    def __init__(self, *args, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __repr__(self):
+        props = ['%s=%s' % (k, v) for k, v in self.__dict__.items()]
+        return '<%s %s>' % (type(self).__name__, ' '.join(props))
 
 
 class ZabbixConnector(object):
@@ -85,195 +78,173 @@ class ZabbixConnector(object):
             icons[icon["name"]] = icon["imageid"]
         return icons
 
-    def get_devices(self, hostgroup):
-        devices = {}
-        hosts = self.get_hosts_from_group(hostgroup)
-        for host in hosts:
-            devices[host['hostid']] = NetworkDevice(
-                name=host['name'],
-                inventory=host['inventory'],
-                neighbors=defaultdict(dict),
-                sysname=host['inventory'].get('name', '')
-            )
+def get_devices_from_zabbix(self, hostgroup):
+    devices = {}
+    hosts = self.get_hosts_from_group(hostgroup)
+    for host in hosts:
+        devices[host['hostid']] = CustomObject(
+            name=host['name'],
+            inventory=host['inventory'],
+            neighbors=defaultdict(dict),
+            sysname=host['inventory'].get('name', '')
+        )
 
-        items = self.get_items(hosts, 'lldp.loc.sys.name')
-        for item in items:
-            if item['lastvalue']:
-                devices[item['hostid']].sysname = item['lastvalue']
+    items = self.get_items(hosts, 'lldp.loc.sys.name')
+    for item in items:
+        if item['lastvalue']:
+            devices[item['hostid']].sysname = item['lastvalue']
 
-        neighbors = self.get_items(hosts, ['lldp.loc.if.name',
-                                           'lldp.loc.if.ifSpeed',
-                                           'lldp.rem.sysname',
-                                           'lldp.rem.port.id',
-                                           'lldp.rem.port.type',
-                                           'lldp.rem.port.desc'])
-        for neighbor in neighbors:
-            port = re.findall(r'\[Port - ([\w:\/]+)\]', neighbor['name'])
-            prop = re.findall(r'^([\w\.]+)\[', neighbor['key_'])
-            if neighbor['lastvalue'] != '** No Information **' and port and prop:
-                devices[neighbor['hostid']].neighbors[port[0]][prop[0]] = neighbor['lastvalue']
+    neighbors = self.get_items(hosts, ['lldp.loc.if.name',
+                                       'lldp.loc.if.ifSpeed',
+                                       'lldp.rem.sysname',
+                                       'lldp.rem.port.id',
+                                       'lldp.rem.port.type',
+                                       'lldp.rem.port.desc'])
+    for neighbor in neighbors:
+        port = re.findall(r'\[Port - ([\w:\/]+)\]', neighbor['name'])
+        prop = re.findall(r'^([\w\.]+)\[', neighbor['key_'])
+        if neighbor['lastvalue'] != '** No Information **' and port and prop:
+            devices[neighbor['hostid']].neighbors[port[0]][prop[0]] = neighbor['lastvalue']
 
-        return devices
-
-
-class NetworkDevice(object):
-    def __init__(self, *args, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
-
-    def __repr__(self):
-        props = ['%s=%s' % (k, v) for k, v in self.__dict__.items()]
-        return '<%s %s>' % (type(self).__name__, ' '.join(props))
+    return devices
 
 
-class LLdpGraphGenerator(object):
-    def __init__(self, devices):
-        self._devices = devices
-
-    def _get_port_number(self, text):
-        result = re.findall(r'(\d+)$', text)
-        if len(result) > 0:
-            return result[0]
-        else:
-            return ''
-
-    def _get_attributes(self, section, key):
-        attributes = config.get('graphviz', {}).get(section, {})
-        return attributes.get(key, {})
-
-    def save_graphviz_file(self, graph, filename):
-        print('Saving file %s...' % filename)
-        pydotG = nx_to_pydot(graph)
-        pydotG.write(filename)
-
-    def save_image(self, graph, filename):
-        print('Saving file %s...' % filename)
-        pydotG = nx_to_pydot(graph)
-        pydotG.write_png(filename)
-
-    def get_graph(self):
-        graph = nx.Graph()
-        graph.attrs = self._get_attributes('attributes', 'graph')
-        graph.node_attrs = self._get_attributes('attributes', 'node')
-        graph.edge_attrs = self._get_attributes('attributes', 'edge')
-        graph.zabbix_nodes = {}
-        device_names = [d.sysname for d in self._devices.values() if getattr(d, 'sysname', None)]
-        for i, (zabbix_id, device) in enumerate(self._devices.items(), start=1):
-            if not getattr(device, 'sysname', None):
+def generate_graph(devices):
+    graph = Dot(graph_type='graph', strict=True)
+    graph.set_graph_defaults(**get_config('graphviz.attributes.graph', {}))
+    graph.set_node_defaults(**get_config('graphviz.attributes.node', {}))
+    graph.set_edge_defaults(**get_config('graphviz.attributes.edge', {}))
+    graph.zabbix_data = {}
+    device_names = [d.sysname for d in devices.values() if getattr(d, 'sysname', None)]
+    for i, (zabbix_id, device) in enumerate(devices.items(), start=1):
+        if not getattr(device, 'sysname', None):
+            continue
+        device.inventory.update({'zabbix_name': device.name})
+        label = Template(get_config(
+            'graphviz.node_label_template', '$zabbix_name')).substitute(device.inventory)
+        graph.add_node(Node(
+            device.sysname, label=label,
+            image=get_config('iconmap', {}).get(device.inventory.get('type', ''))))
+        graph.zabbix_data[device.sysname] = {'zabbix_id': zabbix_id, 'index': i}
+        for idx, neighbor in device.neighbors.items():
+            remSysName = neighbor.get('lldp.rem.sysname')
+            if remSysName is None or remSysName not in device_names:
                 continue
-            device.inventory.update({'zabbix_name': device.name})
-            label = Template(get_config(
-                'graphviz.node_label_template', '$zabbix_name')).substitute(device.inventory)
-            graph.add_node(device.sysname, label=label,
-                           image=get_config('iconmap', {}).get(device.inventory.get('type', '')))
-            graph.zabbix_nodes[device.sysname] = {'zabbix_id': zabbix_id, 'index': i}
-            for idx, neighbor in device.neighbors.items():
-                remSysName = neighbor.get('lldp.rem.sysname')
-                if remSysName is None or remSysName not in device_names:
-                    continue
-                linkSpeed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
-                attrs = self._get_attributes('linkspeed', linkSpeed)
-                if get_config('graphviz.edge_label'):
-                    if neighbor.get('lldp.rem.port.type') == '3':
-                        key = 'lldp.rem.port.desc'
-                    else:
-                        key = 'lldp.rem.port.id'
-                    attrs.update({
-                        'taillabel': neighbor.get('lldp.loc.if.name', ''),
-                        'headlabel': neighbor.get(key, '')
-                    })
-                graph.add_edge(device.sysname, neighbor['lldp.rem.sysname'], **attrs)
+            link_speed = int(neighbor.get('lldp.loc.if.ifSpeed', 0))//1000000
+            link_attrs = get_config('graphviz.linkspeed', {})
+            attrs = link_attrs.get(link_speed, {})
+            if get_config('graphviz.edge_label'):
+                if neighbor.get('lldp.rem.port.type') == '3':
+                    key = 'lldp.rem.port.desc'
+                else:
+                    key = 'lldp.rem.port.id'
+                attrs.update({
+                    'taillabel': neighbor.get('lldp.loc.if.name', ''),
+                    'headlabel': neighbor.get(key, '')
+                })
+            graph.add_edge(Edge(device.sysname, neighbor['lldp.rem.sysname'], **attrs))
 
-        return graph
+    return graph
 
 
-class GraphToZabbixMap(object):
-    def __init__(self, zabbix):
-        self._zabbix = zabbix
-        self._icons = zabbix.get_icons()
-
-    def _get_map_element(self, element_id, zabbix_id, x, y):
+def generate_zabbix_map(zabbix, graph, mapname, width, height):
+    def get_element(index, zabbix_id, icon_id, x, y):
         return {
-            'selementid': element_id,
+            'selementid': index,
             'elements': [{'hostid': zabbix_id}],
             'x': x,
             'y': y,
             'use_iconmap': 1,
             'elementtype': 0,
-            'iconid_off': self._icons['Switch_(24)'],
+            'iconid_off': icon_id,
         }
 
-    def _generate_map_elements(self, G, width, height):
-        zbxG = G.copy()
-        zbxG.graph['dpi'] = 100
-        zbxG.graph['size'] = '%s,%s!' % (width/100, height/100)
-        zbxG.graph['ratio'] = 'fill'
-        zbxG.graph.update(G.attrs)
-        for name, value in G.node_attrs.items():
-            nx.set_node_attributes(zbxG, name, value)
-        for name, value in G.edge_attrs.items():
-            nx.set_edge_attributes(zbxG, name, value)
+    print('Generating map %s (%dx%d)...' % (mapname, width, height))
 
-        nodes_pos = nx.nx_pydot.graphviz_layout(
-            G, get_config('graphviz.attributes.graph.layout', 'dot'))
-        max_x, max_y = map(max, zip(*nodes_pos.values()))
-        elements = []
+    # Get zabbix icons ids
+    icons = zabbix.get_icons()
+    # Duplicate pydot graph for zabbix map
+    zgraph = Dot(graph_type='graph', strict=True)
+    # Set defaults
+    graph_defaults = get_config('graphviz.attributes.graph', {})
+    node_defaults = get_config('graphviz.attributes.node', {})
+    graph_defaults.update({
+        'size': '%s,%s!' % (width/100, height/100),
+        'dpi': 100,
+        'ratio': 'fill'
+    })
+    zgraph.set_graph_defaults(**graph_defaults)
+    node_defaults.update({'fixedsize': True, 'width': 0.5, 'height': 0.5})
+    zgraph.set_node_defaults(**node_defaults)
+    edge_defaults = get_config('graphviz.attributes.edge', {})
+    zgraph.set_edge_defaults(**edge_defaults)
+    # Copy nodes and edges
+    for node in graph.get_nodes():
+        if node.get_name() in ['graph', 'node', 'edge']: continue
+        zgraph.add_node(copy(node))
+    for edge in graph.get_edges():
+        zgraph.add_edge(copy(edge))
+    # Get nodes positions
+    D_bytes = zgraph.create_dot(prog=get_config('graphviz.attributes.graph.layout', 'dot'))
+    D = str(D_bytes, encoding=getpreferredencoding())
+    # List of one or more "pydot.Dot" instances deserialized from this string.
+    Q_list = pydot.graph_from_dot_data(D)
+    assert len(Q_list) == 1
+    # The first and only such instance, as guaranteed by the above assertion.
+    graph_with_pos = Q_list[0]
+    # Get map nodes
+    icon_id = icons.get(get_config('zabbix.map.default_icon'), 'Switch_(24)')
+    elements = []
+    for node in graph_with_pos.get_node_list():
+        if not node.get_pos(): continue
+        args = graph.zabbix_data[node.get_name().strip('"')]
+        x, y = str(node.get_pos()).strip('"').split(',')
+        args.update({'x': int(float(x)), 'y': int(float(y)), 'icon_id': icon_id})
+        elements.append(get_element(**args))
+    
+    # Get map links
+    links = []
+    for edge in graph_with_pos.get_edge_list():
+        edge_color = edge.get('color') or edge_defaults.get('color', '#000000')
+        links.append({
+            'selementid1': graph.zabbix_data[edge.get_source().strip('"')]['index'],
+            'selementid2': graph.zabbix_data[edge.get_destination().strip('"')]['index'],
+            'color': edge_color.lstrip('#')
+        })
 
-        for i, (node, (x, y)) in enumerate(nodes_pos.items(), start=1):
-            node_x = int(x*width/max_x*0.9-x*0.1)
-            node_y = int((height-y*height/max_y)*0.9+y*0.1)
-            elements.append(self._get_map_element(
-                G.zabbix_nodes[node]['index'],
-                G.zabbix_nodes[node]['zabbix_id'],
-                node_x, node_y))
+    map_params = {
+        'name': mapname,
+        'label_format': 1, # ADVANCED_LABELS
+        'label_type_image': 0, #LABEL_TYPE_LABEL
+        'width': width,
+        'height': height,
+        'selements': elements,
+        'links': links
+    }
 
-        return elements
-
-    def _generate_map_links(self, G):
-        links = []
-        for node1, node2, data in G.edges(data=True):
-            links.append({
-                'selementid1': G.zabbix_nodes[node1]['index'],
-                'selementid2': G.zabbix_nodes[node2]['index'],
-            })
-        return links
-
-    def generate_zabbix_map(self, G, mapname, width, height):
-        print('Generating map %s (%dx%d)...' % (mapname, width, height))
-        map_params = {
-            'name': mapname,
-            'label_format': 1, # ADVANCED_LABELS
-            'label_type_image': 0, #LABEL_TYPE_LABEL
-            'width': width,
-            'height': height,
-            'selements': self._generate_map_elements(G, width, height),
-            'links': self._generate_map_links(G)
-        }
-        zabbix_map = self._zabbix.api.map.get(filter={'name': mapname})
-        if zabbix_map:
-            mapid = zabbix_map[0]['sysmapid']
-            print('Updaing map %s (%s)...' % (mapname, mapid))
-            self._zabbix.api.map.update({'sysmapid': mapid, 'links':[], 'selements':[], 'urls':[] })
-            map_params["sysmapid"] = mapid
-            zbx_map = self._zabbix.api.map.update(map_params)
-        else:
-            print('Creating new map %s...' % mapname)
-            zbx_map = self._zabbix.api.map.create(map_params)
+    zabbix_map = zabbix.api.map.get(filter={'name': mapname})
+    if zabbix_map:
+        mapid = zabbix_map[0]['sysmapid']
+        print('Updaing map %s (%s)...' % (mapname, mapid))
+        zabbix.api.map.update({'sysmapid': mapid, 'links':[], 'selements':[], 'urls':[] })
+        map_params["sysmapid"] = mapid
+        zabbix.api.map.update(map_params)
+    else:
+        print('Creating new map %s...' % mapname)
+        zabbix.api.map.create(map_params)
 
 
 if __name__ == '__main__':
     zbx_config = get_config('zabbix')
     zabbix = ZabbixConnector(zbx_config['url'], zbx_config['username'],
                              zbx_config['password'])
-    devices = zabbix.get_devices(zbx_config['hostgroup'])
-    generator = LLdpGraphGenerator(devices)
-    graph = generator.get_graph()
+    devices = get_devices_from_zabbix(zabbix, zbx_config['hostgroup'])
+    graph = generate_graph(devices)
     map_cfg = zbx_config.get('map')
     if 'name' in map_cfg and map_cfg['name']:
-        map_generator = GraphToZabbixMap(zabbix)
-        map_generator.generate_zabbix_map(graph, map_cfg['name'],
-                                          map_cfg['width'], map_cfg['height'])
+        generate_zabbix_map(zabbix, graph, map_cfg['name'], map_cfg['width'], map_cfg['height'])
     if get_config('graphviz.file'):
-        generator.save_graphviz_file(graph, get_config('graphviz.file'))
+        graph.write(get_config('graphviz.file'))
     if get_config('graphviz.imagefile'):
-        generator.save_image(graph, get_config('graphviz.imagefile'))
+        graph.set_shape_files(get_images_paths(graph))
+        graph.write_png(get_config('graphviz.imagefile'))
