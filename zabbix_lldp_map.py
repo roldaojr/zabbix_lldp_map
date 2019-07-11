@@ -10,10 +10,9 @@ from string import Template
 from pyzabbix import ZabbixAPI
 from pydot import Dot, Graph, Node, Edge
 import urllib3
-urllib3.disable_warnings()
 
-with open('config.yml', 'r') as ymlfile:
-    config = yaml.safe_load(ymlfile)
+urllib3.disable_warnings()
+config = {}
 
 def get_config(name, default=None):
     keys = name.split('.')
@@ -148,44 +147,21 @@ def generate_graph(devices):
 
 
 def generate_zabbix_map(zabbix, graph, mapname, width, height):
-    def get_element(index, zabbix_id, icon_id, x, y):
-        return {
-            'selementid': index,
-            'elements': [{'hostid': zabbix_id}],
-            'x': x,
-            'y': y,
-            'use_iconmap': 1,
-            'elementtype': 0,
-            'iconid_off': icon_id,
-        }
-
     print('Generating map %s (%dx%d)...' % (mapname, width, height))
-
     # Get zabbix icons ids
     icons = zabbix.get_icons()
-    # Duplicate pydot graph for zabbix map
-    zgraph = Dot(graph_type='graph', strict=True)
-    # Set defaults
-    graph_defaults = get_config('graphviz.attributes.graph', {})
-    node_defaults = get_config('graphviz.attributes.node', {})
+    # Update graph attributes
+    graph_defaults = graph.get_node('graph')[0].obj_dict['attributes']
+    node_defaults = graph.get_node('node')[0].obj_dict['attributes']
+    edge_defaults = graph.get_node('edge')[0].obj_dict['attributes']
     graph_defaults.update({
         'size': '%s,%s!' % (width/100, height/100),
         'dpi': 100,
         'ratio': 'fill'
     })
-    zgraph.set_graph_defaults(**graph_defaults)
     node_defaults.update({'fixedsize': True, 'width': 0.5, 'height': 0.5})
-    zgraph.set_node_defaults(**node_defaults)
-    edge_defaults = get_config('graphviz.attributes.edge', {})
-    zgraph.set_edge_defaults(**edge_defaults)
-    # Copy nodes and edges
-    for node in graph.get_nodes():
-        if node.get_name() in ['graph', 'node', 'edge']: continue
-        zgraph.add_node(copy(node))
-    for edge in graph.get_edges():
-        zgraph.add_edge(copy(edge))
     # Get nodes positions
-    D_bytes = zgraph.create_dot(prog=get_config('graphviz.attributes.graph.layout', 'dot'))
+    D_bytes = graph.create_dot(prog=get_config('graphviz.attributes.graph.layout', 'dot'))
     D = str(D_bytes, encoding=getpreferredencoding())
     # List of one or more "pydot.Dot" instances deserialized from this string.
     Q_list = pydot.graph_from_dot_data(D)
@@ -197,10 +173,17 @@ def generate_zabbix_map(zabbix, graph, mapname, width, height):
     elements = []
     for node in graph_with_pos.get_node_list():
         if not node.get_pos(): continue
-        args = graph.zabbix_data[node.get_name().strip('"')]
+        data = graph.zabbix_data[node.get_name().strip('"')]
         x, y = str(node.get_pos()).strip('"').split(',')
-        args.update({'x': int(float(x)), 'y': int(float(y)), 'icon_id': icon_id})
-        elements.append(get_element(**args))
+        elements.append({
+            'selementid': data['index'],
+            'elements': [{'hostid': data['zabbix_id']}],
+            'x': int(float(x)),
+            'y': int(float(y)),
+            'use_iconmap': 1,
+            'elementtype': 0,
+            'iconid_off': icon_id,
+        })
     
     # Get map links
     links = []
@@ -235,16 +218,17 @@ def generate_zabbix_map(zabbix, graph, mapname, width, height):
 
 
 if __name__ == '__main__':
-    zbx_config = get_config('zabbix')
-    zabbix = ZabbixConnector(zbx_config['url'], zbx_config['username'],
-                             zbx_config['password'])
-    devices = get_devices_from_zabbix(zabbix, zbx_config['hostgroup'])
+    with open('config.yml', 'r') as ymlfile:
+        config = yaml.safe_load(ymlfile)
+    zabbix = ZabbixConnector(get_config('zabbix.url'), get_config('zabbix.username'),
+                             get_config('zabbix.password'))
+    devices = get_devices_from_zabbix(zabbix, get_config('zabbix.hostgroup'))
     graph = generate_graph(devices)
-    map_cfg = zbx_config.get('map')
-    if 'name' in map_cfg and map_cfg['name']:
-        generate_zabbix_map(zabbix, graph, map_cfg['name'], map_cfg['width'], map_cfg['height'])
     if get_config('graphviz.file'):
         graph.write(get_config('graphviz.file'))
     if get_config('graphviz.imagefile'):
         graph.set_shape_files(get_images_paths(graph))
         graph.write_png(get_config('graphviz.imagefile'))
+    map_cfg = get_config('zabbix.map', {})
+    if 'name' in map_cfg and map_cfg['name']:
+        generate_zabbix_map(zabbix, graph, map_cfg['name'], map_cfg['width'], map_cfg['height'])
