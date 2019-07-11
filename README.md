@@ -3,10 +3,10 @@
 Gerar mapa da rede a partir dos dados de LLDP
 
 ## Requisitos
-    * Python >=3.6
-    * networkx==2.2
-    * pydot==1.2.4
-    * pyzabbix==0.7.5
+    * Python 3
+    * pydot
+    * PyYAML
+    * pyzabbix
 
 Para que o mapa seja gerado é necessário a instalação do modulo do zabbix para descoberta LLDP (https://github.com/zabbix-book/snmp_lldp). E a importação dos templates incluídos do projeto.
 
