@@ -81,6 +81,7 @@ def get_devices_from_zabbix(self, hostgroup):
     devices = {}
     hosts = self.get_hosts_from_group(hostgroup)
     for host in hosts:
+        host['inventory']['ip_address'] = host['interfaces'][-1]['ip']
         devices[host['hostid']] = CustomObject(
             name=host['name'],
             inventory=host['inventory'],
